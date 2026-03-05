@@ -1,0 +1,62 @@
+Project Context: Crypto Spot Exchange + Market Making System
+
+We are building a crypto spot exchange composed of:
+
+1) Matching Engine (ME)
+- The single source of truth for market rules
+- Executes price-time priority matching
+- Deterministic, single-threaded per symbol
+- Outputs Trade events as immutable facts
+- Downstream systems (ledger, balance, reporting) must derive state strictly from Trade events
+
+
+Core Principles:
+- Determinism: identical input event sequence must produce identical output
+- Fairness: price priority > time priority (FIFO per price)
+- Auditability: all state must be replayable
+- Separation of concerns: ME does not calculate balances
+
+Market Contract (per symbol):
+- Base / Quote assets
+- Price tick size
+- Quantity step size
+- Minimum notional
+- Fee model (maker/taker)
+Any order violating these must be rejected before entering matching.
+
+Supported order types (Phase 1, spot):
+- Limit, Market
+- Time-in-force: GTC, IOC, FOK, GTD/Day
+- Execution constraint: PostOnly
+
+Semantics:
+- Market order = IOC + price protection
+- Market orders never rest on the book
+- Partial fill + cancel remainder is allowed
+- Balances must never go negative
+
+Self-Trade Prevention (STP):
+- Mandatory
+- Minimum strategy: Cancel New
+- Applied after price/time match, before Trade generation
+
+Funds & Risk Boundary:
+- Orders enter ME only after funds are frozen
+- Buy: quote frozen
+- Sell: base frozen
+- Settlement strictly based on Trade events
+
+ME Output Events:
+- OrderAck / Reject
+- Trade
+- OrderUpdate (Open / Partial / Filled / Cancelled)
+
+Trade event must include:
+- trade_id, symbol
+- price, quantity
+- maker/taker order & user IDs
+- taker_side
+- fee indicators
+- engine_sequence
+- timestamp
+

@@ -1,0 +1,10 @@
+[package]
+name = "me-rs-core"
+version = "0.1.0"
+edition = "2024"
+authors = ["Boyan <yowhyz@gmail.com>"]
+license = "MIT"
+
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
