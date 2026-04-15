@@ -8,3 +8,5 @@ license = "MIT"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
+ahash = "0.8.12"
+slab = "0.4.12"

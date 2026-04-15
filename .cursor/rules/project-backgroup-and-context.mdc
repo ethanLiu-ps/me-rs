@@ -55,6 +55,11 @@ ME Output Events:
 - Trade
 - OrderUpdate (Open / Partial / Filled / Cancelled)
 
+Documentation:
+- All business documentation (specs, design docs, ADRs, protocol definitions) lives under `doc/`
+- Before implementing any feature, check `doc/` for relevant specs
+- When in doubt about a business rule, treat `doc/` as the authoritative reference
+
 Trade event must include:
 - trade_id, symbol
 - price, quantity
