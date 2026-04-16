@@ -16,6 +16,15 @@ pub enum OrderAction {
 }
 
 impl OrderAction {
+    pub fn is_bid(self) -> bool {
+        self == OrderAction::Bid
+    }
+    pub fn is_ask(self) -> bool {
+        self == OrderAction::Ask
+    }
+}
+
+impl OrderAction {
     pub fn opposite(self) -> OrderAction {
         match self {
             OrderAction::Bid => OrderAction::Ask,

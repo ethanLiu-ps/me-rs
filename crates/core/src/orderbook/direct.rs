@@ -1,11 +1,10 @@
-
 use std::collections::BTreeMap;
 
-use serde::{Serialize, Deserialize};
-use slab::{Slab};
-use ahash::{AHashMap};
+use ahash::AHashMap;
+use serde::{Deserialize, Serialize};
+use slab::Slab;
 
-use crate::api::{*};
+use crate::api::*;
 
 type OrderIdx = usize;
 type BucketIdx = usize;
@@ -35,15 +34,9 @@ struct Bucket {
     tail: OrderIdx,
 }
 
-
-
-
-
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectOrderBook {
     symbol_spec: CoreSymbolSpecification,
-
 
     // 内存池，预分配订单和桶，减少分配开销
     orders: Slab<DirectOrder>,
@@ -59,34 +52,28 @@ pub struct DirectOrderBook {
     // 最优订单快捷引用，类似 LMAX Disruptor 的快速路径
     best_ask_order: Option<OrderIdx>,
     best_bid_order: Option<OrderIdx>,
-    
 }
 
-
 impl DirectOrderBook {
+    // gtc good util cancel
     pub fn place_gtc(&mut self, cmd: &mut OrderCommand) -> CmdResultCode {
-
         CmdResultCode::Success
     }
 }
-
 
 impl super::Orderbook for DirectOrderBook {
     fn new_order(&mut self, cmd: &mut OrderCommand) -> CmdResultCode {
         match cmd.order_type {
             OrderType::GTC => {
                 return self.place_gtc(cmd);
-            },
+            }
             _ => {
                 return CmdResultCode::MatchingUnsupportedCommand;
             }
         }
-
     }
-
 
     fn serialize_state(&self) -> super::OrderBookState {
         super::OrderBookState::Direct(self.clone())
     }
-
 }
