@@ -4,7 +4,7 @@ use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
 use slab::Slab;
 
-use crate::api::*;
+use crate::api::{event::MatcherEvent, *};
 
 type OrderIdx = usize;
 type BucketIdx = usize;
@@ -56,8 +56,12 @@ pub struct DirectOrderBook {
 
 impl DirectOrderBook {
     // gtc good util cancel
-    pub fn place_gtc(&mut self, cmd: &mut OrderCommand) -> CmdResultCode {
-        CmdResultCode::Success
+    pub fn place_gtc(&mut self, cmd: &mut OrderCommand) {
+        // 重复订单直接拒绝
+        if self.order_id_index.contains_key(&cmd.order_id) {
+            cmd.matcher_events
+                .push(MatcherEvent::new_reject(cmd.size, cmd.price));
+        }
     }
 }
 
