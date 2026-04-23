@@ -1,5 +1,5 @@
 [package]
-name = "me-rs-core"
+name = "core"
 version = "0.1.0"
 edition = "2024"
 authors = ["Boyan <yowhyz@gmail.com>"]
