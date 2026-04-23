@@ -203,3 +203,140 @@ me-rs 当前阶段（Phase 1，单线程 per symbol）：**LMAX 风格是正确�
 5. WAL 追加写，不在热路径 fsync
 
 完整 Disruptor（ring buffer + sequence + busy-spin）在需要跨线程传递 command 时才必要。
+
+---
+
+## 五、流程图总览
+
+### 5.1 Ring Buffer 结构
+
+```mermaid
+graph TD
+    subgraph RingBuffer["Ring Buffer（预分配固定大小的环形数组）"]
+        S0["槽位 0\n[cmd]"]
+        S1["槽位 1\n[cmd]"]
+        S2["槽位 2\n[cmd]"]
+        S3["槽位 3\n[cmd]"]
+        S4["槽位 4\n[cmd]"]
+        S5["槽位 5\n[cmd]"]
+        S6["槽位 6\n[cmd]"]
+        S7["槽位 7\n[cmd]"]
+    end
+
+    P["🟢 Producer（网关/客户端）"]
+    C["🔵 Consumer（撮合引擎）"]
+
+    P -->|"写入 sequence=5"| S5
+    C -->|"正在处理 sequence=2"| S2
+
+    S0 --> S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S0
+
+    style S5 fill:#c8f7c5
+    style S2 fill:#c5d7f7
+```
+
+环形数组启动时**一次性分配**，运行时永不分配/释放，Producer 到达数组末尾后回绕覆盖旧槽位。
+
+---
+
+### 5.2 Producer → Consumer 无锁协议
+
+```mermaid
+sequenceDiagram
+    participant P  as Producer
+    participant PC as producer_cursor<br/>（Producer 持有，原子写）
+    participant RB as Ring Buffer<br/>（普通内存）
+    participant CC as consumer_cursor<br/>（Consumer 持有，原子写）
+    participant C  as Consumer
+
+    note over P,C: ── 阶段1：Producer 申请槽位 ──
+
+    P->>PC: ① 读 consumer_cursor，计算剩余空间<br/>（防止追上 Consumer，绕环覆盖未处理数据）
+    PC-->>P: min_consumer_pos = 38
+
+    P->>PC: ② fetch_add(1) 原子递增<br/>producer_cursor: 41 → 42
+    PC-->>P: claimed_seq = 42
+
+    note over P,C: ── 阶段2：Producer 写数据（无锁）──
+
+    P->>RB: ③ 直接写槽位 [42 % 8]<br/>填 uid / price / size / action
+    note right of RB: 普通内存写，无原子操作
+
+    P->>PC: ④ publish(42)<br/>store(Release 内存序)<br/>producer_cursor = 42
+
+    note over P,C: ── 阶段3：Consumer busy-spin 等待 ──
+
+    loop 轮询，直到可读
+        C->>PC: ⑤ load(Acquire) producer_cursor
+        PC-->>C: 返回当前值（可能还 < 42）
+    end
+    note right of C: 拿到 42，可以读了
+
+    note over P,C: ── 阶段4：Consumer 处理（无锁）──
+
+    C->>RB: ⑥ 读槽位 [42 % 8]，写入结果字段<br/>（result_code / matcher_events）
+    note right of RB: 普通内存读写，无原子操作
+
+    C->>CC: ⑦ store(Release)<br/>consumer_cursor = 42
+
+    note over P,C: ── Producer 下一轮会读 consumer_cursor ──
+    P->>CC: ① 再次检查，确认 Consumer 已处理到哪里
+
+```
+
+共享状态只有 Sequence 这一个原子整数，槽位本身的读写**完全无锁**。
+
+---
+
+### 5.3 Pipeline 多阶段流水线（me-rs 落地架构）
+
+```mermaid
+flowchart LR
+    GW["🌐 Gateway\n（TCP/WebSocket）\n解析报文"]
+
+    subgraph RB["Ring Buffer（单 Producer 写入）"]
+        CMD["OrderCommand 槽位\n• uid\n• price / size / action\n• result_code ← 各阶段写回\n• matcher_events ← 预分配"]
+    end
+
+    subgraph PIPE["Pipeline 单线程（绑定 CPU Core）"]
+        R1["① Risk R1\n资金冻结校验\n写 result_code"]
+        ME["② Matching Engine\n撮合\n写 matcher_events"]
+        R2["③ Risk R2\n成交后 balance 更新\n写 balance delta"]
+        JN["④ Journalist\n追加写 WAL"]
+    end
+
+    RD["📤 Result Dispatcher\n推送 OrderAck\nTrade / OrderUpdate"]
+
+    GW -->|"① 填写 OrderCommand"| RB
+    RB -->|"② sequence 可见后"| R1
+    R1 --> ME
+    ME --> R2
+    R2 --> JN
+    JN -->|"③ 读 matcher_events"| RD
+
+    style R1 fill:#fff3cd
+    style ME fill:#d4edda
+    style R2 fill:#fff3cd
+    style JN fill:#d1ecf1
+```
+
+同一块 `OrderCommand` 内存依次流过各处理阶段，**零拷贝、零分配**。
+
+---
+
+### 5.4 与传统消息队列的对比
+
+```mermaid
+graph TD
+    subgraph OLD["❌ 传统方案（有锁队列）"]
+        OP["Producer"] -->|"加锁 enqueue"| OQ["Queue\n（堆上分配 Node）"]
+        OQ -->|"加锁 dequeue"| OC["Consumer"]
+        OQ -.->|"GC 压力 / 锁竞争 / 缓存失效"| PAIN["🔴 性能瓶颈"]
+    end
+
+    subgraph NEW["✅ LMAX Disruptor"]
+        NP["Producer"] -->|"原子 sequence\n无锁写入"| NRB["Ring Buffer\n（预分配连续内存）"]
+        NRB -->|"busy-spin\n零拷贝读取"| NC["Consumer Pipeline"]
+        NRB -.->|"顺序访问 / Cache 友好 / 零 GC"| WIN["🟢 ~微秒级延迟"]
+    end
+```

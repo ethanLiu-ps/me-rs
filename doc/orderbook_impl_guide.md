@@ -8,19 +8,27 @@
 
 ```mermaid
 graph TD
-    OB["DirectOrderBook"]
+    subgraph OB["🏛️ DirectOrderBook（撮合状态核心）"]
+        direction TB
+        STORE["📦 存储池\norders: Slab&lt;DirectOrder&gt;\nbuckets: Slab&lt;Bucket&gt;"]
+        INDEX["🔍 索引\nask_price_buckets: BTreeMap&lt;Price, BucketIdx&gt;\nbid_price_buckets: BTreeMap&lt;Price, BucketIdx&gt;\norder_id_index: AHashMap&lt;OrderId, OrderIdx&gt;"]
+        BEST["⭐ 盘口快照\nbest_ask_order: Option&lt;OrderIdx&gt;\nbest_bid_order: Option&lt;OrderIdx&gt;"]
+    end
 
-    OB -->|"orders: Slab&lt;DirectOrder&gt;"| DO["DirectOrder\n───────────\norder_id\nuid\nprice / size / filled\naction / reserve_price\ntimestamp_ms\nnext / prev / parent"]
+    DO["📋 DirectOrder\n────────────\norder_id / uid\nprice / size / filled\naction / reserve_price\ntimestamp_ms\nnext / prev（双向链表指针）\nparent → BucketIdx"]
 
-    OB -->|"buckets: Slab&lt;Bucket&gt;"| BK["Bucket\n───────────\nprice\nvolume  ← 该价位剩余总量\nnum_orders\ntail    ← 指向最新挂单"]
+    BK["📊 Bucket\n────────────\nprice\nvolume（该价位剩余总量）\nnum_orders\ntail（指向最新挂单）"]
 
-    OB -->|"ask_price_buckets\nBTreeMap&lt;Price,BucketIdx&gt;"| BK
-    OB -->|"bid_price_buckets\nBTreeMap&lt;Price,BucketIdx&gt;"| BK
-    OB -->|"order_id_index\nAHashMap&lt;OrderId,OrderIdx&gt;"| DO
-    OB -->|"best_ask_order\nOption&lt;OrderIdx&gt;"| DO
-    OB -->|"best_bid_order\nOption&lt;OrderIdx&gt;"| DO
+    STORE -->|"分配 order_idx"| DO
+    STORE -->|"分配 bucket_idx"| BK
+    INDEX -.->|"price → bucket"| BK
+    INDEX -.->|"order_id → order"| DO
+    BEST -.->|"指向链表头\n（时间最早，优先撮合）"| DO
+    DO -->|"parent 反向引用"| BK
 
-    DO -->|"parent: BucketIdx"| BK
+    style OB fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
+    style DO fill:#d4edda,stroke:#28a745,color:#155724
+    style BK fill:#fff3cd,stroke:#ffc107,color:#856404
 ```
 
 **链表结构说明**
@@ -30,47 +38,62 @@ graph TD
 ```
 best_ask_order
       ↓
-[OrderA, price=100, next=None, prev=OrderB]   ← 最早挂单，优先被撮合
-      ↑ next
-[OrderB, price=100, next=OrderA, prev=OrderC]
-      ↑ next
-[OrderC, price=100, next=OrderB, prev=None]   ← 最新挂单，Bucket.tail 指向它
+[OrderA, price=100, prev=None, next=OrderB]   ← 最早挂单，优先被撮合
+      ↓ next
+[OrderB, price=100, prev=OrderA, next=OrderC]
+      ↓ next
+[OrderC, price=100, prev=OrderB, next=None]   ← 最新挂单，Bucket.tail 指向它
 
 Bucket(price=100).tail = OrderC
 ```
 
-撮合时沿 `prev` 方向遍历（从 `best_ask_order` 往 `prev` 走），确保时间优先。
+撮合时沿 `next` 方向遍历（从 `best_ask_order` 往 `next` 走），确保时间优先。
 
 ---
 
 ## 二、订单生命周期
 
 ```mermaid
-stateDiagram-v2
-    [*] --> PreMatch: new_order()
+flowchart TD
+    START(["🟢 new_order()"])
+    VALIDATE["① Pre-match 校验\n• 重复 order_id\n• size % lot_size\n• price % tick_size\n• min_qty / min_notional"]
+    MATCH["② try_match\n价格优先 → 时间优先\n遍历对手盘，累计 filled"]
+    D1{"filled\n== size?"}
+    D2{"order_type?"}
+    REST[["③ Resting\n余量在盘口等待"]]
+    MOVE["④ Moved\n• remove_order 旧价位\n• order.price = new_price\n• try_match 重新撮合"]
+    D3{"filled\n== 剩余量?"}
+    DONE(["✓ FullyFilled"])
+    REJ_V(["✗ Rejected\n校验失败"])
+    REJ_IOC(["✗ Rejected\n余量取消"])
+    CANCEL(["✗ Cancelled"])
 
-    PreMatch --> Rejected: 校验失败\n(重复ID / tick_size / min_notional 等)
-    PreMatch --> Matching: 进入撮合
+    START --> VALIDATE
+    VALIDATE -->|"校验失败"| REJ_V
+    VALIDATE -->|"通过"| MATCH
+    MATCH --> D1
+    D1 -->|"是"| DONE
+    D1 -->|"否，有余量"| D2
+    D2 -->|"IOC / FOK"| REJ_IOC
+    D2 -->|"GTC"| REST
+    REST -->|"cancel_order"| CANCEL
+    REST -->|"move_order"| MOVE
+    REST -.->|"被动撮合\n（对手方下单触发）"| DONE
+    MOVE --> D3
+    D3 -->|"是，完全成交"| DONE
+    D3 -->|"否，有余量"| REST
 
-    Matching --> FullyFilled: filled == size
-    Matching --> PartialFilled: 0 < filled < size
-    Matching --> NoFill: filled == 0
+    classDef ok   fill:#d4edda,stroke:#28a745,color:#155724
+    classDef fail fill:#f8d7da,stroke:#dc3545,color:#721c24
+    classDef proc fill:#d1ecf1,stroke:#17a2b8,color:#0c5460
+    classDef wait fill:#fff3cd,stroke:#ffc107,color:#856404
+    classDef gate fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e
 
-    PartialFilled --> Resting: GTC → 余量挂单
-    NoFill --> Resting: GTC → 全量挂单
-    PartialFilled --> Rejected: IOC/FOK → 余量 Reject event
-    NoFill --> Rejected: IOC/FOK → 全量 Reject event
-
-    Resting --> Matching: 被动撮合（对手方下单触发）
-    Resting --> Cancelled: cancel_order()
-    Resting --> Moved: move_order() → 移价
-
-    Moved --> Matching: 新价格尝试撮合
-    Moved --> Resting: 撮合后余量继续挂单
-
-    FullyFilled --> [*]
-    Cancelled --> [*]
-    Rejected --> [*]
+    class START,DONE ok
+    class REJ_V,REJ_IOC,CANCEL fail
+    class VALIDATE,MATCH,MOVE proc
+    class REST wait
+    class D1,D2,D3 gate
 ```
 
 ---
@@ -79,16 +102,36 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TD
-    A([new_order\ncmd: &mut OrderCommand]) --> B{order_type?}
+    A(["🟢 new_order(cmd: &mut OrderCommand)"])
+    B{"order_type?"}
 
-    B -->|GTC| C[place_gtc]
-    B -->|IOC| D[place_ioc]
-    B -->|FOKWithBudget| E[place_fok_budget]
-    B -->|其他| F[cmd.result_code =\nUnsupportedCommand\nreturn]
+    C["place_gtc(cmd)"]
+    D["place_ioc(cmd)"]
+    E["place_fok_budget(cmd)"]
+    F["cmd.result_code =\nUnsupportedCommand\nreturn"]
 
-    C --> G[cmd.result_code = Success]
+    G(["✓ cmd.result_code = Success"])
+    H(["✗ cmd.result_code = UnsupportedCommand"])
+
+    A --> B
+    B -->|"GTC"| C
+    B -->|"IOC"| D
+    B -->|"FOKWithBudget"| E
+    B -->|"其他"| F
+
+    C --> G
     D --> G
     E --> G
+    F --> H
+
+    style A fill:#c8f7c5,stroke:#28a745
+    style B fill:#e8eaf6,stroke:#5c6bc0
+    style C fill:#d1ecf1,stroke:#17a2b8
+    style D fill:#d1ecf1,stroke:#17a2b8
+    style E fill:#d1ecf1,stroke:#17a2b8
+    style F fill:#f8d7da,stroke:#dc3545
+    style G fill:#d4edda,stroke:#28a745
+    style H fill:#f8d7da,stroke:#dc3545
 ```
 
 > **me-rs 风格**：各 `place_*` 函数返回 `()`，结果写回 `cmd.result_code`，不 return CmdResultCode。
@@ -99,17 +142,44 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A([validate_order\ncmd]) --> B{order_id 重复?}
-    B -->|是| Z1[result_code = DuplicateOrderId\npush Reject event\nreturn]
-    B -->|否| C{size % lot_size == 0?}
-    C -->|否| Z2[result_code = InvalidSize\nreturn]
-    C -->|是| D{price % tick_size == 0?}
-    D -->|否| Z3[result_code = InvalidPrice\nreturn]
-    D -->|是| E{size >= min_qty?}
-    E -->|否| Z4[result_code = InvalidSize\nreturn]
-    E -->|是| F{size × price >= min_notional?}
-    F -->|否| Z5[result_code = InvalidSize\nreturn]
-    F -->|是| G([通过，进入撮合])
+    A(["🟢 validate_order(cmd)"])
+    B{"order_id 重复?"}
+    C{"size % lot_size == 0?"}
+    D{"price % tick_size == 0?"}
+    E{"size >= min_qty?"}
+    F{"size × price >= min_notional?"}
+    G(["✓ 通过，进入撮合"])
+
+    Z1["✗ DuplicateOrderId\npush Reject event\nreturn"]
+    Z2["✗ InvalidSize\n（不是 lot_size 整数倍）\nreturn"]
+    Z3["✗ InvalidPrice\n（不是 tick_size 整数倍）\nreturn"]
+    Z4["✗ InvalidSize\n（低于 min_qty）\nreturn"]
+    Z5["✗ InvalidSize\n（低于 min_notional）\nreturn"]
+
+    A --> B
+    B -->|"是"| Z1
+    B -->|"否"| C
+    C -->|"否"| Z2
+    C -->|"是"| D
+    D -->|"否"| Z3
+    D -->|"是"| E
+    E -->|"否"| Z4
+    E -->|"是"| F
+    F -->|"否"| Z5
+    F -->|"是"| G
+
+    style A fill:#c8f7c5,stroke:#28a745
+    style G fill:#d4edda,stroke:#28a745
+    style B fill:#e8eaf6,stroke:#5c6bc0
+    style C fill:#e8eaf6,stroke:#5c6bc0
+    style D fill:#e8eaf6,stroke:#5c6bc0
+    style E fill:#e8eaf6,stroke:#5c6bc0
+    style F fill:#e8eaf6,stroke:#5c6bc0
+    style Z1 fill:#f8d7da,stroke:#dc3545
+    style Z2 fill:#f8d7da,stroke:#dc3545
+    style Z3 fill:#f8d7da,stroke:#dc3545
+    style Z4 fill:#f8d7da,stroke:#dc3545
+    style Z5 fill:#f8d7da,stroke:#dc3545
 ```
 
 ---
@@ -118,17 +188,36 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A([place_gtc]) --> B[try_match\n返回 filled]
-    B --> C{filled == cmd.size?}
-    C -->|是，完全成交| D([结束\n无需挂单])
-    C -->|否，余量| E["orders.insert(DirectOrder {\n  order_id, uid, price,\n  size, filled, action,\n  reserve_price, timestamp_ms,\n  next: None, prev: None, parent: 0\n})"]
-    E --> F[order_id_index.insert\norder_id → order_idx]
-    F --> G[insert_order\norder_idx]
-    G --> H([结束])
+    A(["🟢 place_gtc(cmd)"])
+    B["try_match(cmd)\n→ 返回 filled"]
+    C{"filled == cmd.size?"}
+    D(["✓ 完全成交\n无需挂单"])
+
+    subgraph REST["③ 余量挂单（顺序固定）"]
+        direction TB
+        E["① orders.insert(DirectOrder {\n  order_id, uid, price,\n  size, filled, action,\n  reserve_price, timestamp_ms,\n  next: None, prev: None, parent: 0\n})\n→ 返回 order_idx"]
+        F["② order_id_index.insert\norder_id → order_idx"]
+        G["③ insert_order(order_idx)\n加入价位链表"]
+        E --> F --> G
+    end
+
+    H(["✓ 挂单完成"])
+
+    A --> B --> C
+    C -->|"是"| D
+    C -->|"否，有余量"| E
+    G --> H
+
+    style A fill:#c8f7c5,stroke:#28a745
+    style B fill:#d1ecf1,stroke:#17a2b8
+    style C fill:#e8eaf6,stroke:#5c6bc0
+    style D fill:#d4edda,stroke:#28a745
+    style H fill:#d4edda,stroke:#28a745
+    style REST fill:#fff3cd,stroke:#ffc107
 ```
 
-**注意**：`orders.insert` → `order_id_index.insert` → `insert_order` 顺序固定：
-- `insert_order` 需要读 `orders[order_idx]`（已插入）
+**顺序依赖**：`orders.insert` → `order_id_index.insert` → `insert_order`
+- `insert_order` 需要读 `orders[order_idx]` → `orders.insert` 必须最先
 - `order_id_index` 在 `insert_order` 之前插入，确保 cancel 请求可以立即找到订单
 
 ---
@@ -137,47 +226,97 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A([try_match\ncmd]) --> B{is_bid?}
-    B -->|买单| C[maker_idx = best_ask_order]
-    B -->|卖单| D[maker_idx = best_bid_order]
+    START(["🟢 try_match(cmd)"])
 
-    C --> E{maker_idx 存在\n且价格可成交?}
+    subgraph INIT["① 选择对手盘"]
+        direction TB
+        B{"is_bid?"}
+        C["maker_idx =\nbest_ask_order"]
+        D["maker_idx =\nbest_bid_order"]
+        B -->|"买单"| C
+        B -->|"卖单"| D
+    end
+
+    E{"maker_idx 存在\n且价格可成交?"}
+    EMPTY(["✓ return filled = 0"])
+
+    subgraph LOOP["② 撮合循环：while let Some(idx) = maker_idx"]
+        direction TB
+        G{"remaining =\ncmd.size - filled\n== 0?"}
+        H{"maker 价格\n仍可成交?"}
+        I["trade_size =\nremaining.min(maker.size - maker.filled)"]
+
+        STP{"maker.uid == taker.uid?\n（STP 检查）"}
+        STP_REJ["⚠️ push Reject(cmd.size - filled)\nreturn filled\n不修改任何 maker / bucket 状态"]
+
+        J["maker.filled += trade_size\nbucket.volume -= trade_size\nfilled += trade_size"]
+        M["push Trade event\n• maker_order_id, maker_uid\n• bidder_hold_price"]
+
+        N{"maker 完全成交?"}
+        NEXT["maker_idx = maker.next\n（时间顺序向前走）"]
+
+        subgraph CLEAN["maker 完全成交清理"]
+            direction TB
+            O["bucket.num_orders -= 1\norder_id_index.remove\norders.remove"]
+            P{"bucket 已空?"}
+            Q["price_buckets.remove\nbuckets.remove"]
+            O --> P
+            P -->|"是"| Q
+        end
+
+        G -->|"否"| H
+        H -->|"是"| I
+        I --> STP
+        STP -->|"否"| J
+        J --> M --> N
+        N -->|"否"| NEXT
+        N -->|"是"| O
+        P -->|"否"| NEXT
+        Q --> NEXT
+    end
+
+    BREAK["break 循环"]
+
+    subgraph FINAL["③ 更新盘口指针"]
+        direction TB
+        T{"is_bid?"}
+        U["best_ask_order = maker_idx"]
+        V["best_bid_order = maker_idx"]
+        T -->|"是"| U
+        T -->|"否"| V
+    end
+
+    DONE(["✓ return filled"])
+
+    START --> B
+    C --> E
     D --> E
-    E -->|否| Z([return filled=0])
-    E -->|是| F["循环：while let Some(idx) = maker_idx"]
+    E -->|"否"| EMPTY
+    E -->|"是"| G
+    G -->|"是"| BREAK
+    H -->|"否"| BREAK
+    STP -->|"是 Cancel New"| STP_REJ
+    NEXT --> G
+    BREAK --> T
+    U --> DONE
+    V --> DONE
 
-    F --> G{remaining == 0?}
-    G -->|是| DONE[break]
-    G -->|否| H{价格仍可成交?}
-    H -->|否| DONE
-
-    H -->|是| I["trade_size =\nremaining.min(maker.size - maker.filled)"]
-
-    I --> K{maker.uid == taker.uid?\nSTP 检查}
-    K -->|是 Cancel New| L["push Reject(cmd.size - filled)\nreturn filled\n⚠️ 不修改任何状态"]
-    K -->|否| J[maker.filled += trade_size\nbucket.volume -= trade_size\nfilled += trade_size]
-    J --> M[push Trade event\n包含 maker_order_id + maker_uid\nbidder_hold_price]
-
-    M --> N{maker 完全成交?}
-    N -->|否| DONE
-    N -->|是| O[bucket.num_orders -= 1\norder_id_index.remove\norders.remove]
-    O --> P{bucket 已空?}
-    P -->|是| Q[price_buckets.remove\nbuckets.remove]
-    P -->|否| R[继续]
-    Q --> R
-    R --> S[maker_idx = maker.prev]
-    S --> F
-
-    DONE --> T{is_bid?}
-    T -->|是| U[best_ask_order = maker_idx]
-    T -->|否| V[best_bid_order = maker_idx]
-    U --> W([return filled])
-    V --> W
+    style START fill:#c8f7c5,stroke:#28a745
+    style DONE fill:#d4edda,stroke:#28a745
+    style EMPTY fill:#d4edda,stroke:#28a745
+    style STP_REJ fill:#f8d7da,stroke:#dc3545
+    style BREAK fill:#fff3cd,stroke:#ffc107
+    style INIT fill:#e8eaf6,stroke:#5c6bc0
+    style LOOP fill:#fff3cd,stroke:#ffc107
+    style CLEAN fill:#d1ecf1,stroke:#17a2b8
+    style FINAL fill:#e8eaf6,stroke:#5c6bc0
 ```
 
-**STP 位置**：在计算 `trade_size` **之后**、修改任何状态（`maker.filled` / `bucket.volume`）**之前**检查。触发时直接 return，maker 状态保持不变。
-
-**remaining 重算**：每次循环开始需重新计算 `remaining = cmd.size - filled`，不是常量。
+**关键点**：
+- **STP 位置**：在计算 `trade_size` **之后**、修改任何状态（`maker.filled` / `bucket.volume`）**之前**检查。触发时直接 return，maker 状态保持不变。
+- **remaining 重算**：每次循环开始需重新计算 `remaining = cmd.size - filled`，不是常量。
+- **循环方向**：沿 `maker.next` 遍历（同价位从时间最早向最新推进）；跨价位由 `best_*_order` 指针自然承接。
+- **循环出口**：`maker_idx` 最终值即为新的最优价指针——要么是部分成交的 maker（仍在链上），要么是下一个价位的首单。
 
 ---
 
@@ -185,26 +324,48 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A([insert_order\norder_idx]) --> B[取 order.price, order.action]
-    B --> C{price_buckets\n已有此价位?}
+    START(["🟢 insert_order(order_idx)"])
+    A["读取 order.price, order.action"]
+    B{"price_buckets\n已有此价位?"}
 
-    C -->|是，Bucket 存在| D[old_tail = bucket.tail]
-    D --> E[bucket.tail = order_idx\nbucket.volume += remaining\nbucket.num_orders += 1]
-    E --> F["链表插入（追加到 old_tail 之后）:\nold_tail.prev = order_idx\nprev_of_old_tail.next = order_idx\norder.next = old_tail\norder.prev = prev_of_old_tail\norder.parent = bucket_idx"]
-    F --> Z([结束])
+    subgraph EXIST["路径 A：价位已存在 → 追加到 tail 之后"]
+        direction TB
+        D["old_tail = bucket.tail"]
+        E["bucket.tail = order_idx\nbucket.volume += remaining\nbucket.num_orders += 1"]
+        F["链表追加：\nold_tail.next = order_idx\norder.prev = old_tail\norder.next = None\norder.parent = bucket_idx"]
+        D --> E --> F
+    end
 
-    C -->|否，新价位| G["buckets.insert(Bucket {\n  price, volume, num_orders:1, tail:order_idx\n})"]
-    G --> H[price_buckets.insert\nprice → bucket_idx\norder.parent = bucket_idx]
-    H --> I{找相邻价位\n插入链表位置}
+    subgraph NEW["路径 B：新价位 → 创建 Bucket + 定位插入点"]
+        direction TB
+        G["buckets.insert(Bucket {\n  price, volume,\n  num_orders: 1,\n  tail: order_idx\n})"]
+        H["price_buckets.insert\nprice → bucket_idx\norder.parent = bucket_idx"]
+        I{"找相邻价位（更差一档）\nAsk: 价格 &lt; price 的最高桶\nBid: 价格 &gt; price 的最低桶"}
 
-    I -->|"Ask: 找价格 < price 的最高桶\nBid: 找价格 > price 的最低桶"| J{找到相邻桶?}
+        J["插入到相邻桶 tail 之后：\nnext_of_lower = lower_tail.next\nlower_tail.next = order_idx\norder.prev = lower_tail\norder.next = next_of_lower\nif next_of_lower: orders[next_of_lower].prev = order_idx"]
 
-    J -->|是| K["插入到相邻桶 tail 之前:\nlower_tail.prev = order_idx\nprev_of_lower.next = order_idx\norder.next = lower_tail\norder.prev = prev_of_lower"]
-    K --> Z
+        K["⭐ 成为新最优价：\nold_best = best_ask/bid_order\nold_best.prev = order_idx\nbest_ask/bid_order = order_idx\norder.prev = None\norder.next = old_best"]
 
-    J -->|否，成为新的最优价| L[old_best = best_ask/bid_order]
-    L --> M["old_best.next = order_idx\nbest_ask/bid_order = order_idx\norder.next = None\norder.prev = old_best"]
-    M --> Z
+        G --> H --> I
+        I -->|"找到相邻桶"| J
+        I -->|"无相邻桶"| K
+    end
+
+    DONE(["✓ 挂单完成"])
+
+    START --> A --> B
+    B -->|"是"| D
+    B -->|"否"| G
+    F --> DONE
+    J --> DONE
+    K --> DONE
+
+    style START fill:#c8f7c5,stroke:#28a745
+    style DONE fill:#d4edda,stroke:#28a745
+    style A fill:#d1ecf1,stroke:#17a2b8
+    style B fill:#e8eaf6,stroke:#5c6bc0
+    style EXIST fill:#d1ecf1,stroke:#17a2b8
+    style NEW fill:#fff3cd,stroke:#ffc107
 ```
 
 ---
@@ -212,35 +373,55 @@ flowchart TD
 ## 八、cancel / move / reduce 对比
 
 ```mermaid
-flowchart LR
-    subgraph cancel_order
-        CA[order_id_index.get] --> CB{uid 匹配?}
-        CB -->|否| CX[UnknownOrderId]
-        CB -->|是| CC[order_id_index.remove]
-        CC --> CD[remove_order]
-        CD --> CE[orders.remove]
-        CE --> CF[push Reject\n全部余量]
+flowchart TB
+    subgraph CANCEL["🚫 cancel_order（完全撤单）"]
+        direction TB
+        CA["order_id_index.get(order_id)"]
+        CB{"uid 匹配?"}
+        CX["✗ UnknownOrderId"]
+        CC["order_id_index.remove"]
+        CD["remove_order\n（从价位链表摘除）"]
+        CE["orders.remove\n（回收 Slab slot）"]
+        CF["push Reject event\nsize = 剩余量"]
+        CA --> CB
+        CB -->|"否"| CX
+        CB -->|"是"| CC --> CD --> CE --> CF
     end
 
-    subgraph move_order
-        MA[order_id_index.get] --> MB{风控检查\nnew_price > reserve?}
-        MB -->|是| MX[InvalidReservePrice]
-        MB -->|否| MC[remove_order\n从旧价位移除]
-        MC --> MD[order.price = new_price]
-        MD --> ME["temp_cmd.size =\norder.size - order.filled\n⚠️ 传剩余量，不是原始总量"]
-        ME --> MF[try_match temp_cmd\n返回 filled_in_move]
-        MF --> MG{filled_in_move ==\norder.size - order.filled?}
-        MG -->|是，完全成交| MH[order_id_index.remove\norders.remove]
-        MG -->|否，余量继续挂单| MI["order.filled += filled_in_move\n⚠️ 累加，不是覆盖\ninsert_order 新价位"]
+    subgraph MOVE["🔄 move_order（改价重挂）"]
+        direction TB
+        MA["order_id_index.get(order_id)"]
+        MB{"风控检查\nnew_price &gt; reserve?"}
+        MX["✗ InvalidReservePrice"]
+        MC["remove_order\n（从旧价位移除）"]
+        MD["order.price = new_price"]
+        ME["⚠️ temp_cmd.size =\norder.size - order.filled\n（传剩余量，不是原始总量）"]
+        MF["try_match(temp_cmd)\n→ filled_in_move"]
+        MG{"filled_in_move ==\norder.size - order.filled?"}
+        MH["order_id_index.remove\norders.remove"]
+        MI["⚠️ order.filled += filled_in_move\n（累加，不是覆盖）\ninsert_order 新价位"]
+        MA --> MB
+        MB -->|"是"| MX
+        MB -->|"否"| MC --> MD --> ME --> MF --> MG
+        MG -->|"完全成交"| MH
+        MG -->|"有余量"| MI
     end
 
-    subgraph reduce_order
-        RA[order_id_index.get] --> RB{reduce_by == remaining?}
-        RB -->|是，全部减掉| RC[order_id_index.remove\nremove_order\norders.remove]
-        RB -->|否，部分减少| RD[order.size -= reduce_by\nbucket.volume -= reduce_by]
-        RC --> RE[push Reject\nreduce_by 数量]
-        RD --> RE
+    subgraph REDUCE["➖ reduce_order（减量，保持时间优先级）"]
+        direction TB
+        RA["order_id_index.get(order_id)"]
+        RB{"reduce_by == 剩余量?"}
+        RC["全部减掉：\norder_id_index.remove\nremove_order\norders.remove"]
+        RD["部分减少：\norder.size -= reduce_by\nbucket.volume -= reduce_by"]
+        RE["push Reject event\nsize = reduce_by"]
+        RA --> RB
+        RB -->|"是"| RC --> RE
+        RB -->|"否"| RD --> RE
     end
+
+    style CANCEL fill:#f8d7da,stroke:#dc3545
+    style MOVE fill:#fff3cd,stroke:#ffc107
+    style REDUCE fill:#d1ecf1,stroke:#17a2b8
 ```
 
 **关键差异**：

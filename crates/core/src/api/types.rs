@@ -104,6 +104,7 @@ pub enum CmdResultCode {
     // matching
     MatchingInvalidOrderbookId,
     MatchingUnknownOrderId,
+    MatchingDuplicateOrderId,
     MatchingUnsupportedCommand,
     MatchingMoveFailedPriceOverRiskLimit,
     MatchingReduceFailedWrongSize,

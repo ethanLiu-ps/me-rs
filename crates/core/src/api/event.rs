@@ -18,6 +18,7 @@ pub struct MatcherEvent {
     pub event_type: MatcherEventType,
     pub size: Size,
     pub price: Price,
+    pub trade_id: u64,
     // 买单预留价格
     pub bidder_hold_price: Price,
     pub maker_order_id: OrderId,
@@ -30,6 +31,7 @@ impl Default for MatcherEvent {
             event_type: MatcherEventType::Trade,
             size: 0,
             price: 0,
+            trade_id: 0,
             bidder_hold_price: 0,
             maker_order_id: 0,
             maker_uid: 0,
@@ -43,6 +45,7 @@ impl MatcherEvent {
             event_type: MatcherEventType::Reject,
             size,
             price,
+            trade_id: 0,
             bidder_hold_price: 0,
             maker_order_id: 0,
             maker_uid: 0,
