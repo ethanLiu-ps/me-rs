@@ -5,7 +5,7 @@ use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
 use slab::Slab;
 
-use crate::api::{event::MatcherEvent, *};
+use crate::api::{*};
 
 type OrderIdx = usize;
 type BucketIdx = usize;
@@ -245,7 +245,101 @@ impl DirectOrderBook {
     }
 
     pub fn try_match(&mut self, cmd: &mut OrderCommand) -> Size {
-        0
+        let mut filled : Size= 0;
+        let is_ask = cmd.action.is_ask();
+        let mut maker_order_idx = if cmd.action.is_ask() { self.best_bid_order} else { self.best_ask_order};
+        if let Some(maker_idx) = maker_order_idx {
+            // taker只接受自己的价格或者更优的价格，拒绝任何差的报价
+            // ask 希望更高价，bid希望更低价
+            if  is_ask && self.orders[maker_idx].price < cmd.price || !is_ask && self.orders[maker_idx].price > cmd.price {
+                return 0;
+            }
+
+            // STP
+            if self.orders[maker_idx].uid == cmd.uid {
+                match self.symbol_spec.stp_mode {
+                    StpMode::CancelNew => {
+                        // 取消taker
+                        cmd.matcher_events.push(MatcherEvent::new_reject(cmd.size - filled, cmd.price));
+                        return 0;
+                    },
+                    StpMode::CancelOld => {
+                        // 取消maker
+                        maker_order_idx = self.orders[maker_idx].next;
+                        self.reject_maker_order(cmd, maker_idx);
+                    }
+                    StpMode::CancelBoth => {
+                        // 取消taker
+                        cmd.matcher_events.push(MatcherEvent::new_reject(cmd.size - filled, cmd.price));
+                        // 取消maker
+                        self.reject_maker_order(cmd, maker_idx);
+                        return 0;
+                    }
+                }
+            }
+        } else {
+            return 0;
+        }
+
+        while let Some(maker_idx) = maker_order_idx {
+            // 需要在这里加价格边界检查                                                                     
+            let maker_price = self.orders[maker_idx].price;
+            if is_ask && maker_price < cmd.price || !is_ask && maker_price > cmd.price {                    
+                break;                                                                                    
+            }
+
+            let remaining = cmd.size - filled;
+            if remaining == 0{
+                break
+            }
+
+            // TODO STP
+            let trade_size = remaining.min(self.get_order_size(maker_idx));
+
+
+            // taker
+            let matcher_event =  self.new_matcher_event_trade(trade_size, self.orders[maker_idx].price, self.orders[maker_idx].reserve_price, self.orders[maker_idx].order_id, self.orders[maker_idx].uid);
+            filled += trade_size;
+            cmd.matcher_events.push(matcher_event);
+            if filled != cmd.size {
+                maker_order_idx = self.orders[maker_idx].next;
+            }
+
+            // maker
+            self.orders[maker_idx].filled += trade_size;
+            self.buckets[self.orders[maker_idx].parent].volume -= trade_size;
+            if self.orders[maker_idx].filled == self.orders[maker_idx].size {
+                self.remove_order(maker_idx);
+            }
+        }
+        filled
+
+    }
+
+    fn reject_maker_order(&mut self, cmd: &mut OrderCommand, maker_order_idx: OrderIdx){ 
+        cmd.matcher_events.push(
+            MatcherEvent::new_maker_cancel(self.get_order_size(maker_order_idx), self.orders[maker_order_idx].price, self.orders[maker_order_idx].order_id, self.orders[maker_order_idx].uid)
+        );
+        self.remove_order(maker_order_idx);
+    }
+
+    fn new_matcher_event_trade(&mut self, trade_size: Size, price: Price, bidder_hold_price: Price, maker_order_id: OrderId, maker_uid: UserId) -> MatcherEvent {
+        let trade_id = self.trade_seq;
+        self.trade_seq += 1;
+        MatcherEvent{
+            event_type: MatcherEventType::Trade,
+            size: trade_size,
+            price: price,
+            trade_id: trade_id,
+            bidder_hold_price: bidder_hold_price,
+            maker_order_id: maker_order_id,
+            maker_uid: maker_uid,
+        }
+    }
+
+    #[inline]
+    fn get_order_size(&self, order_idx: OrderIdx) -> Size {
+        self.orders[order_idx].size - self.orders[order_idx].filled
     }
 }
 

@@ -10,7 +10,9 @@ pub enum MatcherEventType {
     Reject,
     // 撮合减量
     Reduce,
-}
+    // maker 被 STP 取消（携带 maker 信息）
+    CancelMaker,
+ }
 
 // 撮合事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +51,18 @@ impl MatcherEvent {
             bidder_hold_price: 0,
             maker_order_id: 0,
             maker_uid: 0,
+        }
+    }
+
+    pub fn new_maker_cancel(size: Size, price: Price, maker_order_id: OrderId, maker_uid: UserId) -> Self {
+        Self {
+            event_type: MatcherEventType::CancelMaker,
+            size,
+            price,
+            trade_id: 0,
+            bidder_hold_price: 0,
+            maker_order_id,
+            maker_uid,
         }
     }
 }
